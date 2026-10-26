@@ -1,0 +1,64 @@
+{
+
+  "cookies_file": "cookies.txt",
+
+  "monitored_channel_ids": [
+    1563019490688761916,
+    1562916824792825957,
+    1563607259903303883,
+    1563639015901761566
+  ],
+  "temp_dir": "temp",
+  "max_concurrent_downloads": 2,
+  "max_queue_size": 20,
+  "max_download_size_mb": 2048,
+  "cookies_from_browser": "",
+  "max_upload_size_mb": 0,
+  "fallback_upload_limit_mb": 20,
+  "compress_if_too_large": true,
+  "compression_attempts": 4,
+  "compression_audio_bitrate_kbps": 96,
+  "compression_min_video_bitrate_kbps": 250,
+  "ffmpeg_path": "",
+  "ffprobe_path": "",
+  "log_level": "INFO",
+  "deduplicate_posts": true,
+  "reply_with_progress": true,
+  "shutdown_drain_timeout_seconds": 60,
+  "delete_source_message_on_success": true,
+  "display_settings": {
+    "default": {
+      "show_author_name": false,
+      "show_account_name": false,
+      "show_post_text": false,
+      "show_original_link": true,
+      "heading": ""
+    },
+    "groups": {
+      "archive": {
+        "show_author_name": true,
+        "show_account_name": true,
+        "show_post_text": true,
+        "show_original_link": true,
+        "heading": ""
+      },
+      "links_only": {
+        "show_author_name": false,
+        "show_account_name": false,
+        "show_post_text": false,
+        "show_original_link": true,
+        "heading": ""
+      }
+    },
+    "channels": {
+      "1563019490688761916": "archive",
+      "1562916824792825957": "links_only",
+      "1563607259903303883": "links_only",
+      "1563639015901761566": "links_only"
+    }
+  },
+  "cookies_from_browsers": [
+    "firefox",
+    "brave"
+  ]
+}
