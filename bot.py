@@ -34,7 +34,8 @@ from bot_core import (
     format_post_metadata, is_pixiv_url, mb_to_bytes, normalize_cookie_browser,
     normalize_cookie_browsers, normalize_display_settings, resolve_display_settings, should_ignore_bot_message,
     message_text_for_url_detection, positive_int, looks_like_auth_error,
-    browser_cookie_lock_guidance,
+    browser_cookie_lock_guidance, normalize_channel_bool_overrides,
+    resolve_channel_bool_setting,
 )
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -91,10 +92,10 @@ def read_config() -> dict[str, Any]:
         raise ConfigError("config.json の最上位はJSONオブジェクトにしてください。")
 
     channel_ids = config.get("monitored_channel_ids")
-    if not isinstance(channel_ids, list) or not channel_ids:
+    if not isinstance(channel_ids, list):
         raise ConfigError(
-            "監視チャンネルが未設定です。config.json の monitored_channel_ids に "
-            "DiscordチャンネルIDを1つ以上設定してください。全チャンネル監視はしません。"
+            "monitored_channel_ids はDiscordチャンネルIDの配列にしてください。 "
+            "空配列 [] の場合は自動変換を停止します。全チャンネル監視はしません。"
         )
     normalized_ids: list[int] = []
     for item in channel_ids:
@@ -110,11 +111,15 @@ def read_config() -> dict[str, Any]:
 
     config["max_concurrent_downloads"] = min(8, positive_int(config.get("max_concurrent_downloads"), 2))
     config["max_queue_size"] = min(500, positive_int(config.get("max_queue_size"), 20))
-    config["max_download_size_mb"] = positive_int(config.get("max_download_size_mb"), 2048)
+    config["max_download_size_mb"] = positive_int(config.get("max_download_size_mb"), 8192)
+    config["max_split_parts"] = min(500, positive_int(config.get("max_split_parts"), 100))
     config["fallback_upload_limit_mb"] = positive_int(config.get("fallback_upload_limit_mb"), 20)
-    config["compression_attempts"] = min(8, positive_int(config.get("compression_attempts"), 4))
+    config["compression_attempts"] = min(12, positive_int(config.get("compression_attempts"), 8))
     config["compression_audio_bitrate_kbps"] = positive_int(config.get("compression_audio_bitrate_kbps"), 96)
-    config["compression_min_video_bitrate_kbps"] = positive_int(config.get("compression_min_video_bitrate_kbps"), 250)
+    config["compression_min_video_bitrate_kbps"] = positive_int(config.get("compression_min_video_bitrate_kbps"), 100)
+    # Try Windows D3D11VA hardware decoding during FFmpeg video compression by default.
+    # Only a JSON boolean true enables it; strings such as "false" do not accidentally enable it.
+    config["use_gpu_decode"] = config.get("use_gpu_decode", True) is True
     config["shutdown_drain_timeout_seconds"] = positive_int(config.get("shutdown_drain_timeout_seconds"), 60)
     upload_mb = config.get("max_upload_size_mb", 0)
     try:
@@ -124,6 +129,10 @@ def read_config() -> dict[str, Any]:
 
     try:
         config["display_settings"] = normalize_display_settings(config.get("display_settings", {}))
+        config["deduplicate_posts_by_channel"] = normalize_channel_bool_overrides(
+            config.get("deduplicate_posts_by_channel", {}),
+            setting_name="deduplicate_posts_by_channel",
+        )
     except ValueError as exc:
         raise ConfigError(str(exc)) from exc
 
@@ -718,7 +727,7 @@ def compress_video_sync(
     for attempt in range(config["compression_attempts"]):
         video_kbps = max(min_video_kbps, int(start_video_kbps * (0.72 ** attempt)))
         output = output_dir / f"compressed_{attempt + 1}.mp4"
-        command = [
+        base_command = [
             ffmpeg_path, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
             "-i", str(source), "-map", "0:v:0", "-map", "0:a?",
             "-c:v", "libx264", "-preset", "veryfast", "-b:v", f"{video_kbps}k",
@@ -727,15 +736,63 @@ def compress_video_sync(
             "-c:a", "aac", "-b:a", f"{audio_kbps}k",
             "-movflags", "+faststart", "-map_metadata", "-1", str(output),
         ]
-        logger.info("動画を圧縮します (試行 %s/%s、映像約 %s kbps)", attempt + 1, config["compression_attempts"], video_kbps)
-        result = subprocess.run(
-            command, capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=max(120, int(duration * 4 + 60)), check=False,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
+        timeout = max(120, int(duration * 4 + 60))
+        result = None
+        gpu_decode_requested = config.get("use_gpu_decode", True) and os.name == "nt"
+
+        if gpu_decode_requested:
+            # D3D11VA uses supported AMD/Intel/NVIDIA hardware video decoders on Windows.
+            # Keep libx264 as the encoder: this setting enables GPU *decoding*, not GPU encoding.
+            # FFmpeg transfers decoded frames back to system memory for the software encoder.
+            gpu_command = list(base_command)
+            input_index = gpu_command.index("-i")
+            gpu_command[input_index:input_index] = ["-hwaccel", "d3d11va"]
+            try:
+                output.unlink(missing_ok=True)
+                logger.info(
+                    "動画を圧縮します (試行 %s/%s、D3D11VA GPUデコード、映像約 %s kbps)",
+                    attempt + 1, config["compression_attempts"], video_kbps,
+                )
+                result = subprocess.run(
+                    gpu_command, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                    timeout=timeout, check=False,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            except subprocess.TimeoutExpired as exc:
+                result = subprocess.CompletedProcess(gpu_command, 124, "", f"タイムアウト: {exc}")
+
+            gpu_succeeded = (
+                result.returncode == 0 and output.is_file() and output.stat().st_size > 0
+            )
+            if not gpu_succeeded:
+                gpu_error = (result.stderr or "").strip()
+                logger.warning(
+                    "D3D11VA GPUデコードに失敗したためCPUデコードへ切り替えます: %s",
+                    gpu_error[-600:] or f"終了コード {result.returncode}",
+                )
+                output.unlink(missing_ok=True)
+                result = None
+
+        if result is None or result.returncode != 0 or not output.is_file() or output.stat().st_size == 0:
+            # Always retain a CPU decode fallback so unsupported codecs/drivers do not break uploads.
+            try:
+                output.unlink(missing_ok=True)
+                logger.info(
+                    "動画を圧縮します (試行 %s/%s、CPUデコード、映像約 %s kbps)",
+                    attempt + 1, config["compression_attempts"], video_kbps,
+                )
+                result = subprocess.run(
+                    base_command, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                    timeout=timeout, check=False,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            except subprocess.TimeoutExpired as exc:
+                result = subprocess.CompletedProcess(base_command, 124, "", f"タイムアウト: {exc}")
+
         if result.returncode != 0 or not output.is_file() or output.stat().st_size == 0:
+            output.unlink(missing_ok=True)
             last_output = None
-            logger.warning("FFmpeg圧縮試行 %s が失敗しました: %s", attempt + 1, result.stderr[-1200:])
+            logger.warning("FFmpeg圧縮試行 %s が失敗しました: %s", attempt + 1, (result.stderr or "")[-1200:])
             continue
         last_output = output
         if file_size_bytes(output) <= max_bytes:
@@ -746,6 +803,94 @@ def compress_video_sync(
             f"圧縮を試しましたが上限以下になりませんでした ({file_size_bytes(last_output) / 1048576:.2f} MiB、上限 {max_bytes / 1048576:.2f} MiB)。"
         )
     raise RuntimeError("FFmpeg圧縮に失敗しました。ログを確認してください。")
+
+
+
+def split_video_sync(
+    source: Path,
+    output_dir: Path,
+    max_bytes: int,
+    ffmpeg_path: str,
+    ffprobe_path: str,
+    logger: logging.Logger,
+    max_parts: int = 100,
+) -> list[Path]:
+    """Split a video into separate MP4 files, each under Discord's per-file cap.
+
+    Stream-copy is used to avoid an additional quality loss. Segment duration is
+    reduced and retried if keyframe spacing creates any part that is still too big.
+    """
+    if max_bytes <= 0:
+        raise RuntimeError("動画分割のサイズ上限が不正です。")
+    duration = probe_duration_sync(source, ffprobe_path)
+    source_bytes = file_size_bytes(source)
+    target_bytes = max(1, int(max_bytes * 0.82))
+    if source_bytes <= max_bytes:
+        return [source]
+    segment_seconds = max(0.5, duration * target_bytes / max(1, source_bytes))
+    pattern = output_dir / "split_part_%03d.mp4"
+    timeout = max(120, int(duration * 2 + 60))
+
+    for attempt in range(12):
+        for old_part in output_dir.glob("split_part_*.mp4"):
+            try:
+                old_part.unlink(missing_ok=True)
+            except OSError:
+                pass
+        command = [
+            ffmpeg_path, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+            "-i", str(source), "-map", "0:v:0", "-map", "0:a?", "-c", "copy",
+            "-f", "segment", "-segment_time", f"{segment_seconds:.3f}",
+            "-reset_timestamps", "1", "-segment_format", "mp4", str(pattern),
+        ]
+        logger.info(
+            "動画を分割します (試行 %s/12、目標約 %.2f 秒/パート、上限 %.2f MiB)",
+            attempt + 1, segment_seconds, max_bytes / 1048576,
+        )
+        try:
+            result = subprocess.run(
+                command, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=timeout, check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except subprocess.TimeoutExpired as exc:
+            result = subprocess.CompletedProcess(command, 124, "", f"タイムアウト: {exc}")
+
+        parts = sorted(
+            (path for path in output_dir.glob("split_part_*.mp4") if path.is_file() and path.stat().st_size > 0),
+            key=lambda path: path.name,
+        )
+        if result.returncode != 0 or len(parts) < 2:
+            logger.warning("動画分割に失敗しました: %s", (result.stderr or "出力パートが作成されませんでした")[-1000:])
+            for part in parts:
+                part.unlink(missing_ok=True)
+            segment_seconds *= 0.65
+            continue
+        if len(parts) > max_parts:
+            raise RuntimeError(
+                f"動画を分割すると{len(parts)}パート必要ですが、設定上限は{max_parts}パートです。"
+                " config.json の max_split_parts を増やすか、動画を短くしてください。"
+            )
+        oversize = [part for part in parts if file_size_bytes(part) > max_bytes]
+        if not oversize:
+            logger.info(
+                "動画分割成功: %s パート、合計 %.2f MiB",
+                len(parts), sum(file_size_bytes(part) for part in parts) / 1048576,
+            )
+            return parts
+        largest = max(file_size_bytes(part) for part in oversize) / 1048576
+        logger.warning(
+            "分割後も上限を超えるパートがあります (最大 %.2f MiB / 上限 %.2f MiB)。分割時間を短縮します。",
+            largest, max_bytes / 1048576,
+        )
+        for part in parts:
+            part.unlink(missing_ok=True)
+        segment_seconds = max(0.25, segment_seconds * 0.65)
+
+    raise RuntimeError(
+        "動画をDiscordのファイル上限以下に分割できませんでした。FFmpegのログ、動画形式、"
+        "実際のアップロード上限を確認してください。"
+    )
 
 
 def compress_audio_sync(
@@ -878,6 +1023,608 @@ class XVideoBot(discord.Client):
         # Tracks all X links found in each source message. Delete the source only
         # after every link from that message was queued and uploaded successfully.
         self._source_batches: dict[int, dict[str, Any]] = {}
+        self.tree = discord.app_commands.CommandTree(self)
+        self._application_commands_synced = False
+        self._register_channel_commands()
+        self._register_display_commands()
+        self._register_duplicate_commands()
+
+    def _register_channel_commands(self) -> None:
+        """Register administrator-only slash commands for runtime channel management."""
+        async def add_channel(
+            interaction: discord.Interaction,
+            channel: discord.TextChannel | None = None,
+        ) -> None:
+            if not await self._authorize_channel_command(interaction):
+                return
+            guild = interaction.guild
+            target = channel or interaction.channel
+            if guild is None or not isinstance(target, discord.TextChannel) or target.guild.id != guild.id:
+                await interaction.response.send_message(
+                    "対象はこのサーバー内のテキストチャンネルにしてください。コマンドをチャンネル内で実行すれば、そのチャンネルを指定できます。",
+                    ephemeral=True,
+                )
+                return
+            if target.id in self.monitored_ids:
+                await interaction.response.send_message(
+                    f"{target.mention} はすでに自動変換の対象です。", ephemeral=True
+                )
+                return
+
+            bot_member = guild.me
+            if bot_member is not None and not target.permissions_for(bot_member).view_channel:
+                await interaction.response.send_message(
+                    f"Botに {target.mention} の「チャンネルを見る」権限がありません。先にチャンネル権限を確認してください。",
+                    ephemeral=True,
+                )
+                return
+
+            previous_ids = set(self.monitored_ids)
+            self.monitored_ids.add(target.id)
+            try:
+                self._persist_monitored_channel_ids()
+            except OSError as exc:
+                self.monitored_ids = previous_ids
+                self.config["monitored_channel_ids"] = sorted(previous_ids)
+                self.logger.exception("監視チャンネル設定の保存に失敗しました")
+                await interaction.response.send_message(
+                    f"設定を保存できませんでした: `{type(exc).__name__}`。Botフォルダーの書き込み権限を確認してください。",
+                    ephemeral=True,
+                )
+                return
+
+            warning = ""
+            if bot_member is not None:
+                perms = target.permissions_for(bot_member)
+                missing = []
+                if not perms.read_message_history:
+                    missing.append("メッセージ履歴を読む")
+                if not perms.send_messages:
+                    missing.append("メッセージを送信")
+                if not perms.attach_files:
+                    missing.append("ファイルを添付")
+                if self.config.get("delete_source_message_on_success", True) and not perms.manage_messages:
+                    missing.append("メッセージを管理（元投稿の削除用）")
+                if missing:
+                    warning = "\n\n⚠️ Botに不足している可能性がある権限: " + "、".join(missing)
+            await interaction.response.send_message(
+                f"✅ {target.mention} を自動変換チャンネルに追加しました。再起動は不要です。{warning}",
+                ephemeral=True,
+            )
+            self.logger.info("スラッシュコマンドで監視チャンネルを追加しました (guild_id=%s, channel_id=%s, user_id=%s)", guild.id, target.id, interaction.user.id)
+
+        async def remove_channel(
+            interaction: discord.Interaction,
+            channel: discord.TextChannel | None = None,
+        ) -> None:
+            if not await self._authorize_channel_command(interaction):
+                return
+            guild = interaction.guild
+            target = channel or interaction.channel
+            if guild is None or not isinstance(target, discord.TextChannel) or target.guild.id != guild.id:
+                await interaction.response.send_message(
+                    "対象はこのサーバー内のテキストチャンネルにしてください。コマンドをチャンネル内で実行すれば、そのチャンネルを指定できます。",
+                    ephemeral=True,
+                )
+                return
+            if target.id not in self.monitored_ids:
+                await interaction.response.send_message(
+                    f"{target.mention} は自動変換の対象に設定されていません。", ephemeral=True
+                )
+                return
+
+            previous_ids = set(self.monitored_ids)
+            self.monitored_ids.discard(target.id)
+            try:
+                self._persist_monitored_channel_ids()
+            except OSError as exc:
+                self.monitored_ids = previous_ids
+                self.config["monitored_channel_ids"] = sorted(previous_ids)
+                self.logger.exception("監視チャンネル設定の保存に失敗しました")
+                await interaction.response.send_message(
+                    f"設定を保存できませんでした: `{type(exc).__name__}`。Botフォルダーの書き込み権限を確認してください。",
+                    ephemeral=True,
+                )
+                return
+
+            await interaction.response.send_message(
+                f"✅ {target.mention} を自動変換チャンネルから削除しました。再起動は不要です。",
+                ephemeral=True,
+            )
+            self.logger.info("スラッシュコマンドで監視チャンネルを削除しました (guild_id=%s, channel_id=%s, user_id=%s)", guild.id, target.id, interaction.user.id)
+
+        async def list_channels(interaction: discord.Interaction) -> None:
+            if not await self._authorize_channel_command(interaction):
+                return
+            guild = interaction.guild
+            if guild is None:
+                await interaction.response.send_message("このコマンドはサーバー内で使用してください。", ephemeral=True)
+                return
+            lines = [
+                f"• {channel.mention} (`{channel.id}`)"
+                for channel in guild.text_channels
+                if channel.id in self.monitored_ids
+            ]
+            if lines:
+                content = "**このサーバーの自動変換チャンネル**\n" + "\n".join(lines)
+            else:
+                content = "このサーバーには自動変換チャンネルがありません。`/convert_channel_add` で追加できます。"
+            await interaction.response.send_message(content, ephemeral=True)
+
+        add_channel = discord.app_commands.guild_only()(add_channel)
+        add_channel = discord.app_commands.default_permissions(manage_guild=True)(add_channel)
+        add_channel = discord.app_commands.describe(
+            channel="追加するチャンネル。省略するとコマンドを実行したチャンネルです。"
+        )(add_channel)
+        remove_channel = discord.app_commands.guild_only()(remove_channel)
+        remove_channel = discord.app_commands.default_permissions(manage_guild=True)(remove_channel)
+        remove_channel = discord.app_commands.describe(
+            channel="削除するチャンネル。省略するとコマンドを実行したチャンネルです。"
+        )(remove_channel)
+        list_channels = discord.app_commands.guild_only()(list_channels)
+        list_channels = discord.app_commands.default_permissions(manage_guild=True)(list_channels)
+
+        self.tree.add_command(discord.app_commands.Command(
+            name="convert_channel_add",
+            description="指定したテキストチャンネルを自動変換の対象に追加します",
+            callback=add_channel,
+        ))
+        self.tree.add_command(discord.app_commands.Command(
+            name="convert_channel_remove",
+            description="指定したテキストチャンネルを自動変換の対象から削除します",
+            callback=remove_channel,
+        ))
+        self.tree.add_command(discord.app_commands.Command(
+            name="convert_channel_list",
+            description="このサーバーの自動変換チャンネルを一覧表示します",
+            callback=list_channels,
+        ))
+
+    def _register_display_commands(self) -> None:
+        """Register administrator-only commands for channel display profiles."""
+
+        def get_target_channel(
+            interaction: discord.Interaction,
+            channel: discord.TextChannel | None,
+        ) -> discord.TextChannel | None:
+            guild = interaction.guild
+            target = channel or interaction.channel
+            if guild is None or not isinstance(target, discord.TextChannel) or target.guild.id != guild.id:
+                return None
+            return target
+
+        def display_flags(profile: dict[str, object]) -> str:
+            labels = (
+                ("show_author_name", "投稿者"),
+                ("show_account_name", "アカウント名"),
+                ("show_post_text", "投稿本文"),
+                ("show_original_link", "元リンク"),
+            )
+            values = [f"{label}: {'表示' if profile.get(key) else '非表示'}" for key, label in labels]
+            heading = str(profile.get("heading", ""))
+            values.append(f"見出し: {heading if heading else 'なし'}")
+            return " / ".join(values)
+
+        async def list_profiles(
+            interaction: discord.Interaction,
+            channel: discord.TextChannel | None = None,
+        ) -> None:
+            if not await self._authorize_channel_command(interaction):
+                return
+            target = get_target_channel(interaction, channel)
+            if target is None:
+                await interaction.response.send_message(
+                    "対象はこのサーバー内のテキストチャンネルにしてください。", ephemeral=True
+                )
+                return
+
+            settings = self.config.get("display_settings", {})
+            groups = settings.get("groups", {}) if isinstance(settings, dict) else {}
+            channels = settings.get("channels", {}) if isinstance(settings, dict) else {}
+            current_assignment = channels.get(target.id, channels.get(str(target.id))) if isinstance(channels, dict) else None
+            current_group = None
+            if isinstance(current_assignment, str):
+                current_group = current_assignment
+            elif isinstance(current_assignment, dict) and isinstance(current_assignment.get("group"), str):
+                current_group = current_assignment["group"]
+
+            current = resolve_display_settings(settings, target.id)
+            lines = [f"**{target.mention} の表示設定**"]
+            lines.append(f"現在のプロファイル: `{current_group or 'チャンネル個別設定 / default'}`")
+            lines.append(display_flags(current))
+            lines.append("\n**利用できるプロファイル**")
+            if isinstance(groups, dict) and groups:
+                for name, profile in sorted(groups.items(), key=lambda item: str(item[0]).lower()):
+                    if isinstance(profile, dict):
+                        lines.append(f"• `{name}` — {display_flags(profile)}")
+            else:
+                lines.append("登録済みプロファイルはありません。`/display_profile_create` で作成してください。")
+            await interaction.response.send_message("\n".join(lines)[:1950], ephemeral=True)
+
+        async def create_profile(
+            interaction: discord.Interaction,
+            profile_name: str,
+            show_author_name: bool,
+            show_account_name: bool,
+            show_post_text: bool,
+            show_original_link: bool,
+            heading: str | None = None,
+        ) -> None:
+            if not await self._authorize_channel_command(interaction):
+                return
+            name = profile_name.strip().lower()
+            if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,31}", name) or name == "default":
+                await interaction.response.send_message(
+                    "プロファイル名は英小文字・数字・`_`・`-` の32文字以内にしてください（`default` は使用できません）。",
+                    ephemeral=True,
+                )
+                return
+
+            settings = self.config.setdefault("display_settings", {"default": {}, "groups": {}, "channels": {}})
+            if not isinstance(settings, dict):
+                await interaction.response.send_message("表示設定の形式が不正です。config.json を確認してください。", ephemeral=True)
+                return
+            groups = settings.setdefault("groups", {})
+            if not isinstance(groups, dict):
+                await interaction.response.send_message("表示プロファイルの保存領域が不正です。config.json を確認してください。", ephemeral=True)
+                return
+            previous = groups.get(name)
+            profile = {
+                "show_author_name": show_author_name,
+                "show_account_name": show_account_name,
+                "show_post_text": show_post_text,
+                "show_original_link": show_original_link,
+                "heading": (heading or "").strip()[:80],
+            }
+            groups[name] = profile
+            try:
+                self._persist_config()
+            except OSError as exc:
+                if previous is None:
+                    groups.pop(name, None)
+                else:
+                    groups[name] = previous
+                self.logger.exception("表示プロファイルの保存に失敗しました")
+                await interaction.response.send_message(
+                    f"設定を保存できませんでした: `{type(exc).__name__}`。Botフォルダーの書き込み権限を確認してください。",
+                    ephemeral=True,
+                )
+                return
+            await interaction.response.send_message(
+                f"✅ 表示プロファイル `{name}` を保存しました。\n{display_flags(profile)}\n"
+                "適用するには `/display_profile_set` を実行してください。既にこのプロファイルを使うチャンネルにも変更が反映されます。",
+                ephemeral=True,
+            )
+
+        async def set_profile(
+            interaction: discord.Interaction,
+            profile_name: str,
+            channel: discord.TextChannel | None = None,
+        ) -> None:
+            if not await self._authorize_channel_command(interaction):
+                return
+            target = get_target_channel(interaction, channel)
+            if target is None:
+                await interaction.response.send_message(
+                    "対象はこのサーバー内のテキストチャンネルにしてください。", ephemeral=True
+                )
+                return
+            name = profile_name.strip().lower()
+            settings = self.config.get("display_settings", {})
+            groups = settings.get("groups", {}) if isinstance(settings, dict) else {}
+            if not isinstance(groups, dict) or name not in groups:
+                available = ", ".join(f"`{key}`" for key in sorted(groups)) if isinstance(groups, dict) else "なし"
+                await interaction.response.send_message(
+                    f"プロファイル `{name}` がありません。利用可能: {available}。`/display_profile_create` で作成できます。",
+                    ephemeral=True,
+                )
+                return
+            channels = settings.setdefault("channels", {})
+            previous = channels.get(target.id)
+            channels[target.id] = name
+            try:
+                self._persist_config()
+            except OSError as exc:
+                if previous is None:
+                    channels.pop(target.id, None)
+                else:
+                    channels[target.id] = previous
+                self.logger.exception("チャンネル表示プロファイルの保存に失敗しました")
+                await interaction.response.send_message(
+                    f"設定を保存できませんでした: `{type(exc).__name__}`。Botフォルダーの書き込み権限を確認してください。",
+                    ephemeral=True,
+                )
+                return
+            profile = resolve_display_settings(settings, target.id)
+            await interaction.response.send_message(
+                f"✅ {target.mention} に表示プロファイル `{name}` を設定しました。再起動は不要です。\n{display_flags(profile)}",
+                ephemeral=True,
+            )
+
+        async def set_items(
+            interaction: discord.Interaction,
+            show_author_name: bool | None = None,
+            show_account_name: bool | None = None,
+            show_post_text: bool | None = None,
+            show_original_link: bool | None = None,
+            heading: str | None = None,
+            channel: discord.TextChannel | None = None,
+        ) -> None:
+            if not await self._authorize_channel_command(interaction):
+                return
+            target = get_target_channel(interaction, channel)
+            if target is None:
+                await interaction.response.send_message(
+                    "対象はこのサーバー内のテキストチャンネルにしてください。", ephemeral=True
+                )
+                return
+            changes = {
+                "show_author_name": show_author_name,
+                "show_account_name": show_account_name,
+                "show_post_text": show_post_text,
+                "show_original_link": show_original_link,
+            }
+            changes = {key: value for key, value in changes.items() if value is not None}
+            if heading is not None:
+                changes["heading"] = heading.strip()[:80]
+            if not changes:
+                await interaction.response.send_message(
+                    "変更する項目を1つ以上指定してください。true は表示、false は非表示です。",
+                    ephemeral=True,
+                )
+                return
+
+            settings = self.config.setdefault("display_settings", {"default": {}, "groups": {}, "channels": {}})
+            channels = settings.setdefault("channels", {})
+            previous = channels.get(target.id)
+            updated = resolve_display_settings(settings, target.id)
+            updated.update(changes)
+            channels[target.id] = updated
+            try:
+                self._persist_config()
+            except OSError as exc:
+                if previous is None:
+                    channels.pop(target.id, None)
+                else:
+                    channels[target.id] = previous
+                self.logger.exception("チャンネル表示項目の保存に失敗しました")
+                await interaction.response.send_message(
+                    f"設定を保存できませんでした: `{type(exc).__name__}`。Botフォルダーの書き込み権限を確認してください。",
+                    ephemeral=True,
+                )
+                return
+            await interaction.response.send_message(
+                f"✅ {target.mention} の表示項目を更新しました。再起動は不要です。\n{display_flags(updated)}",
+                ephemeral=True,
+            )
+
+        list_profiles = discord.app_commands.guild_only()(list_profiles)
+        list_profiles = discord.app_commands.default_permissions(manage_guild=True)(list_profiles)
+        list_profiles = discord.app_commands.describe(
+            channel="確認するチャンネル。省略するとコマンドを実行したチャンネルです。"
+        )(list_profiles)
+        create_profile = discord.app_commands.guild_only()(create_profile)
+        create_profile = discord.app_commands.default_permissions(manage_guild=True)(create_profile)
+        create_profile = discord.app_commands.describe(
+            profile_name="英小文字・数字・_・- で指定するプロファイル名",
+            show_author_name="投稿者の表示名を表示するか",
+            show_account_name="@アカウント名を表示するか",
+            show_post_text="投稿本文を表示するか",
+            show_original_link="元投稿リンクを表示するか",
+            heading="任意の見出し。空欄なら見出しなし",
+        )(create_profile)
+        set_profile = discord.app_commands.guild_only()(set_profile)
+        set_profile = discord.app_commands.default_permissions(manage_guild=True)(set_profile)
+        set_profile = discord.app_commands.describe(
+            profile_name="適用するプロファイル名（例: archive / links_only）",
+            channel="設定するチャンネル。省略するとコマンドを実行したチャンネルです。",
+        )(set_profile)
+        set_items = discord.app_commands.guild_only()(set_items)
+        set_items = discord.app_commands.default_permissions(manage_guild=True)(set_items)
+        set_items = discord.app_commands.describe(
+            show_author_name="投稿者の表示名（true=表示 / false=非表示）",
+            show_account_name="@アカウント名（true=表示 / false=非表示）",
+            show_post_text="投稿本文（true=表示 / false=非表示）",
+            show_original_link="元投稿リンク（true=表示 / false=非表示）",
+            heading="見出し。空欄にすると見出しを消します。",
+            channel="設定するチャンネル。省略するとコマンドを実行したチャンネルです。",
+        )(set_items)
+
+        commands = (
+            ("display_profile_list", "利用可能な表示プロファイルと現在の設定を表示します", list_profiles),
+            ("display_profile_create", "表示項目を選んで独自プロファイルを作成または更新します", create_profile),
+            ("display_profile_set", "このチャンネルに表示プロファイルを適用します", set_profile),
+            ("display_items_set", "このチャンネルで表示する項目を個別に設定します", set_items),
+        )
+        for name, description, callback in commands:
+            self.tree.add_command(discord.app_commands.Command(name=name, description=description, callback=callback))
+
+    def _register_duplicate_commands(self) -> None:
+        """Register administrator-only per-channel duplicate-skip controls."""
+        async def set_duplicate_skip(
+            interaction: discord.Interaction,
+            enabled: bool,
+            channel: discord.TextChannel | None = None,
+        ) -> None:
+            if not await self._authorize_channel_command(interaction):
+                return
+            guild = interaction.guild
+            target = channel or interaction.channel
+            if guild is None or not isinstance(target, discord.TextChannel) or target.guild.id != guild.id:
+                await interaction.response.send_message(
+                    "対象はこのサーバー内のテキストチャンネルにしてください。", ephemeral=True
+                )
+                return
+
+            overrides = self.config.setdefault("deduplicate_posts_by_channel", {})
+            previous = overrides.get(target.id)
+            had_previous = target.id in overrides
+            overrides[target.id] = enabled
+            try:
+                self._persist_config()
+            except OSError as exc:
+                if had_previous:
+                    overrides[target.id] = previous
+                else:
+                    overrides.pop(target.id, None)
+                self.logger.exception("チャンネル重複スキップ設定の保存に失敗しました")
+                await interaction.response.send_message(
+                    f"設定を保存できませんでした: `{type(exc).__name__}`。Botフォルダーの書き込み権限を確認してください。",
+                    ephemeral=True,
+                )
+                return
+
+            if enabled:
+                description = "有効：過去に正常変換した同じ投稿IDはスキップします。"
+            else:
+                description = (
+                    "無効：正常変換済みの同じ投稿も再変換します。"
+                    "ただし、同じ投稿がキュー内または処理中の場合は二重処理を防ぐためスキップします。"
+                )
+            await interaction.response.send_message(
+                f"✅ {target.mention} の重複投稿スキップを **{'有効' if enabled else '無効'}** にしました。\n{description}",
+                ephemeral=True,
+            )
+            self.logger.info(
+                "チャンネル重複スキップ設定を変更しました (guild_id=%s, channel_id=%s, enabled=%s, user_id=%s)",
+                guild.id, target.id, enabled, interaction.user.id,
+            )
+
+        async def show_duplicate_skip_status(
+            interaction: discord.Interaction,
+            channel: discord.TextChannel | None = None,
+        ) -> None:
+            if not await self._authorize_channel_command(interaction):
+                return
+            guild = interaction.guild
+            target = channel or interaction.channel
+            if guild is None or not isinstance(target, discord.TextChannel) or target.guild.id != guild.id:
+                await interaction.response.send_message(
+                    "対象はこのサーバー内のテキストチャンネルにしてください。", ephemeral=True
+                )
+                return
+            overrides = self.config.get("deduplicate_posts_by_channel", {})
+            is_custom = target.id in overrides
+            enabled = resolve_channel_bool_setting(
+                self.config.get("deduplicate_posts", True), overrides, target.id
+            )
+            source = "チャンネル個別設定" if is_custom else "全体の既定値を継承"
+            detail = (
+                "成功済みの同一投稿をスキップします。" if enabled
+                else "成功済みの同一投稿も再変換します（処理中・キュー内の二重処理は防止します）。"
+            )
+            await interaction.response.send_message(
+                f"**{target.mention} の重複投稿スキップ設定**\n"
+                f"状態: **{'有効' if enabled else '無効'}**\n"
+                f"適用元: {source}\n{detail}",
+                ephemeral=True,
+            )
+
+        async def reset_duplicate_skip(
+            interaction: discord.Interaction,
+            channel: discord.TextChannel | None = None,
+        ) -> None:
+            if not await self._authorize_channel_command(interaction):
+                return
+            guild = interaction.guild
+            target = channel or interaction.channel
+            if guild is None or not isinstance(target, discord.TextChannel) or target.guild.id != guild.id:
+                await interaction.response.send_message(
+                    "対象はこのサーバー内のテキストチャンネルにしてください。", ephemeral=True
+                )
+                return
+            overrides = self.config.setdefault("deduplicate_posts_by_channel", {})
+            if target.id not in overrides:
+                await interaction.response.send_message(
+                    f"{target.mention} はすでに全体の既定値を使用しています。", ephemeral=True
+                )
+                return
+            previous = overrides.pop(target.id)
+            try:
+                self._persist_config()
+            except OSError as exc:
+                overrides[target.id] = previous
+                self.logger.exception("チャンネル重複スキップ設定のリセットに失敗しました")
+                await interaction.response.send_message(
+                    f"設定を保存できませんでした: `{type(exc).__name__}`。Botフォルダーの書き込み権限を確認してください。",
+                    ephemeral=True,
+                )
+                return
+            enabled = bool(self.config.get("deduplicate_posts", True))
+            await interaction.response.send_message(
+                f"✅ {target.mention} の個別設定を削除し、全体の既定値に戻しました（{'有効' if enabled else '無効'}）。",
+                ephemeral=True,
+            )
+
+        set_duplicate_skip = discord.app_commands.guild_only()(set_duplicate_skip)
+        set_duplicate_skip = discord.app_commands.default_permissions(manage_guild=True)(set_duplicate_skip)
+        set_duplicate_skip = discord.app_commands.describe(
+            enabled="true=成功済みの重複をスキップ / false=成功済みでも再変換",
+            channel="設定するチャンネル。省略するとコマンドを実行したチャンネルです。",
+        )(set_duplicate_skip)
+        show_duplicate_skip_status = discord.app_commands.guild_only()(show_duplicate_skip_status)
+        show_duplicate_skip_status = discord.app_commands.default_permissions(manage_guild=True)(show_duplicate_skip_status)
+        show_duplicate_skip_status = discord.app_commands.describe(
+            channel="確認するチャンネル。省略するとコマンドを実行したチャンネルです。",
+        )(show_duplicate_skip_status)
+        reset_duplicate_skip = discord.app_commands.guild_only()(reset_duplicate_skip)
+        reset_duplicate_skip = discord.app_commands.default_permissions(manage_guild=True)(reset_duplicate_skip)
+        reset_duplicate_skip = discord.app_commands.describe(
+            channel="既定値に戻すチャンネル。省略するとコマンドを実行したチャンネルです。",
+        )(reset_duplicate_skip)
+
+        commands = (
+            ("duplicate_skip_set", "指定チャンネルの重複投稿スキップを有効／無効にします", set_duplicate_skip),
+            ("duplicate_skip_status", "指定チャンネルの重複投稿スキップ設定を確認します", show_duplicate_skip_status),
+            ("duplicate_skip_reset", "指定チャンネルの重複投稿設定を全体の既定値に戻します", reset_duplicate_skip),
+        )
+        for name, description, callback in commands:
+            self.tree.add_command(discord.app_commands.Command(name=name, description=description, callback=callback))
+
+    async def _authorize_channel_command(self, interaction: discord.Interaction) -> bool:
+        """Only server administrators or members with Manage Server can change channels."""
+        if interaction.guild is None:
+            await interaction.response.send_message("このコマンドはサーバー内で使用してください。", ephemeral=True)
+            return False
+        permissions = getattr(interaction.user, "guild_permissions", None)
+        if permissions is None or not (permissions.administrator or permissions.manage_guild):
+            await interaction.response.send_message(
+                "この操作には「サーバー管理」または「管理者」権限が必要です。", ephemeral=True
+            )
+            return False
+        return True
+
+    def _persist_config(self) -> None:
+        """Atomically save the serializable runtime configuration to config.json."""
+        serializable = {key: value for key, value in self.config.items() if not key.startswith("_")}
+        temporary_path = CONFIG_PATH.with_name(CONFIG_PATH.name + ".tmp")
+        try:
+            temporary_path.write_text(
+                json.dumps(serializable, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(temporary_path, CONFIG_PATH)
+        finally:
+            temporary_path.unlink(missing_ok=True)
+
+    def _persist_monitored_channel_ids(self) -> None:
+        """Save monitored channel IDs and the full runtime configuration."""
+        self.config["monitored_channel_ids"] = sorted(self.monitored_ids)
+        self._persist_config()
+
+    async def _sync_application_commands(self) -> None:
+        """Sync globally and copy commands into joined guilds for immediate availability."""
+        if self._application_commands_synced:
+            return
+        try:
+            global_commands = await self.tree.sync()
+            self.logger.info("グローバルスラッシュコマンドを同期しました (%s件)", len(global_commands))
+            for guild in self.guilds:
+                self.tree.copy_global_to(guild=guild)
+                await self.tree.sync(guild=guild)
+            self._application_commands_synced = True
+        except Exception:
+            self.logger.exception("スラッシュコマンドの同期に失敗しました。Discord側の権限・接続とapplications.commandsスコープを確認してください。")
 
     async def setup_hook(self) -> None:
         self.worker_tasks = [
@@ -888,6 +1635,7 @@ class XVideoBot(discord.Client):
 
     async def on_ready(self) -> None:
         self.logger.info("Discordに接続しました: %s (ID: %s)", self.user, self.user.id if self.user else "?")
+        await self._sync_application_commands()
         self.logger.info("監視対象チャンネルID: %s", sorted(self.monitored_ids))
         self.logger.info(
             "元リンク自動削除: %s",
@@ -951,7 +1699,11 @@ class XVideoBot(discord.Client):
                 claimed = self.dedup_store.claim(
                     status_id,
                     message.id,
-                    deduplicate_success=self.config["deduplicate_posts"],
+                    deduplicate_success=resolve_channel_bool_setting(
+                        self.config["deduplicate_posts"],
+                        self.config.get("deduplicate_posts_by_channel", {}),
+                        message.channel.id,
+                    ),
                 )
             except Exception:
                 batch["can_delete"] = False
@@ -1120,8 +1872,8 @@ class XVideoBot(discord.Client):
 
                 if not media_paths:
                     raise FileNotFoundError("ダウンロードされたメディアファイルがありません。")
-                if len(media_paths) > 10:
-                    raise RuntimeError(f"添付ファイルが{len(media_paths)}個あります。Discordの1メッセージ上限10個を超えています。")
+                if media_type == "image" and len(media_paths) > 10:
+                    raise RuntimeError(f"画像が{len(media_paths)}枚あります。Discordの1メッセージ上限10個を超えています。")
 
                 limit = self._upload_limit_bytes(job.message)
                 upload_paths: list[Path] = []
@@ -1131,38 +1883,69 @@ class XVideoBot(discord.Client):
                         raise RuntimeError(
                             f"ダウンロードしたファイルが設定上限を超えています ({media_path.name}: {size / 1048576:.1f} MiB)。"
                         )
-                    upload_path = media_path
-                    if size > limit:
-                        self.logger.info(
-                            "アップロード上限超過 (投稿ID=%s、種類=%s): %.2f MiB > %.2f MiB",
-                            job.status_id, media_type, size / 1048576, limit / 1048576,
+                    if size <= limit:
+                        upload_paths.append(media_path)
+                        continue
+
+                    self.logger.info(
+                        "アップロード上限超過 (投稿ID=%s、種類=%s): %.2f MiB > %.2f MiB",
+                        job.status_id, media_type, size / 1048576, limit / 1048576,
+                    )
+                    if not self.config["compress_if_too_large"]:
+                        raise RuntimeError(
+                            f"{self._media_type_label(media_type)}ファイルがDiscordのアップロード上限を超えています ({size / 1048576:.1f} MiB / 上限 {limit / 1048576:.1f} MiB)。圧縮は設定で無効です。"
                         )
-                        if not self.config["compress_if_too_large"]:
-                            raise RuntimeError(
-                                f"{self._media_type_label(media_type)}ファイルがDiscordのアップロード上限を超えています ({size / 1048576:.1f} MiB / 上限 {limit / 1048576:.1f} MiB)。圧縮は設定で無効です。"
-                            )
-                        if media_type == "image":
-                            raise RuntimeError(
-                                f"画像ファイルがDiscordのアップロード上限を超えています ({size / 1048576:.1f} MiB / 上限 {limit / 1048576:.1f} MiB)。画像の自動圧縮は未対応です。"
-                            )
-                        if not self.ffmpeg_path or not self.ffprobe_path:
-                            raise RuntimeError(
-                                f"{self._media_type_label(media_type)}ファイルが上限超過 ({size / 1048576:.1f} MiB / 上限 {limit / 1048576:.1f} MiB) で、FFmpegまたはFFprobeが見つからないため圧縮できません。"
-                            )
-                        if media_type == "video":
+                    if media_type == "image":
+                        raise RuntimeError(
+                            f"画像ファイルがDiscordのアップロード上限を超えています ({size / 1048576:.1f} MiB / 上限 {limit / 1048576:.1f} MiB)。画像の自動圧縮は未対応です。"
+                        )
+                    if not self.ffmpeg_path or not self.ffprobe_path:
+                        raise RuntimeError(
+                            f"{self._media_type_label(media_type)}ファイルが上限超過 ({size / 1048576:.1f} MiB / 上限 {limit / 1048576:.1f} MiB) で、FFmpegまたはFFprobeが見つからないため圧縮できません。"
+                        )
+                    if media_type == "video":
+                        try:
                             upload_path = await asyncio.to_thread(
                                 compress_video_sync,
                                 media_path, job_dir, limit, self.config, self.ffmpeg_path, self.ffprobe_path, self.logger,
                             )
-                        elif media_type == "audio":
-                            upload_path = await asyncio.to_thread(
-                                compress_audio_sync,
-                                media_path, job_dir, limit, self.config, self.ffmpeg_path, self.ffprobe_path, self.logger,
+                            if file_size_bytes(upload_path) > limit:
+                                raise RuntimeError("圧縮後もDiscordの上限を超えています。")
+                            upload_paths.append(upload_path)
+                        except Exception as compression_exc:
+                            # If a complete video cannot fit as one attachment, split it into playable parts.
+                            # Prefer the last successful compressed attempt, else split the source stream-copy.
+                            self.logger.warning(
+                                "動画を1ファイルに圧縮できませんでした。複数パートへの分割を試します: %s",
+                                str(compression_exc)[:500],
                             )
+                            candidates = sorted(
+                                (p for p in job_dir.glob("compressed_*.mp4") if p.is_file() and p.stat().st_size > 0),
+                                key=lambda p: p.stat().st_mtime,
+                            )
+                            split_source = candidates[-1] if candidates else media_path
+                            split_dir = job_dir / f"split_source_{len(upload_paths) + 1:03d}"
+                            split_dir.mkdir(parents=True, exist_ok=True)
+                            split_paths = await asyncio.to_thread(
+                                split_video_sync,
+                                split_source, split_dir, limit, self.ffmpeg_path, self.ffprobe_path,
+                                self.logger, self.config["max_split_parts"],
+                            )
+                            for part in split_paths:
+                                if file_size_bytes(part) > limit:
+                                    raise RuntimeError("分割後の動画パートがDiscordのアップロード上限を超えています。")
+                            upload_paths.extend(split_paths)
+                    elif media_type == "audio":
+                        upload_path = await asyncio.to_thread(
+                            compress_audio_sync,
+                            media_path, job_dir, limit, self.config, self.ffmpeg_path, self.ffprobe_path, self.logger,
+                        )
                         size = file_size_bytes(upload_path)
                         if size > limit:
                             raise RuntimeError(f"圧縮後の{self._media_type_label(media_type)}ファイルがDiscordのアップロード上限を超えています。")
-                    upload_paths.append(upload_path)
+                        upload_paths.append(upload_path)
+                    else:
+                        raise RuntimeError(f"未対応のメディア種別です: {media_type}")
 
                 base_names: list[str] = []
                 platform_prefix = "pixiv" if is_pixiv_url(job.url) else "x"
@@ -1170,6 +1953,8 @@ class XVideoBot(discord.Client):
                     suffix = path.suffix.lower()
                     if media_type == "image":
                         base_names.append(f"{platform_prefix}_image_{job.status_id}_{index:02d}{suffix}")
+                    elif media_type == "video" and len(upload_paths) > 1:
+                        base_names.append(f"{platform_prefix}_video_{job.status_id}_part_{index:03d}{suffix}")
                     else:
                         base_names.append(f"{platform_prefix}_{media_type}_{job.status_id}{suffix}")
 
@@ -1226,8 +2011,6 @@ class XVideoBot(discord.Client):
     ) -> None:
         if not paths or len(paths) != len(filenames):
             raise RuntimeError("アップロード対象ファイルの指定が不正です。")
-        if len(paths) > 10:
-            raise RuntimeError("Discordの1メッセージあたりの添付上限10個を超えています。")
         last_error: Exception | None = None
         channel_display = resolve_display_settings(self.config.get("display_settings", {}), job.message.channel.id)
         display_metadata = dict(metadata or {})
@@ -1236,40 +2019,52 @@ class XVideoBot(discord.Client):
             if channel_display.get("heading") == "X投稿情報":
                 channel_display["heading"] = "Pixiv投稿情報"
         content = format_post_metadata(display_metadata, job.url, max_chars=1850, settings=channel_display)
-        for attempt in range(3):
-            try:
-                # Reopen each file on every retry, because discord.py may close file
-                # handles during a failed HTTP request. Original URL and all media
-                # attachments are sent in one message, with link embeds suppressed.
-                files: list[discord.File] = []
+        batch_count = (len(paths) + 9) // 10
+        for batch_index, start in enumerate(range(0, len(paths), 10)):
+            batch_paths = paths[start:start + 10]
+            batch_filenames = filenames[start:start + 10]
+            if batch_index == 0:
+                batch_content = content
+                if batch_count > 1:
+                    batch_content = f"🎞️ 分割動画（1/{len(paths)}パート）\n{content}"[:1900]
+            else:
+                batch_content = f"🎞️ 分割動画の続き（メッセージ {batch_index + 1}/{batch_count}）\nソース: {job.url}"[:1900]
+            last_error = None
+            for attempt in range(3):
                 try:
-                    # discord.File is not a context manager in all discord.py versions.
-                    # Create handles explicitly, then always close them after send/retry.
-                    for path, filename in zip(paths, filenames):
-                        files.append(discord.File(str(path), filename=filename))
-                    await job.message.channel.send(
-                        content=content,
-                        files=files,
-                        allowed_mentions=discord.AllowedMentions.none(),
-                        suppress_embeds=True,
-                    )
-                finally:
-                    for file_obj in files:
-                        try:
-                            file_obj.close()
-                        except Exception:
-                            self.logger.debug("Discord添付ファイルのハンドルを閉じられませんでした", exc_info=True)
-                return
-            except discord.HTTPException as exc:
-                last_error = exc
-                if exc.status < 500 or attempt >= 2:
+                    # Discord allows at most 10 attachments per message; large videos are sent in batches.
+                    files: list[discord.File] = []
+                    try:
+                        for path, filename in zip(batch_paths, batch_filenames):
+                            files.append(discord.File(str(path), filename=filename))
+                        await job.message.channel.send(
+                            content=batch_content,
+                            files=files,
+                            allowed_mentions=discord.AllowedMentions.none(),
+                            suppress_embeds=True,
+                        )
+                    finally:
+                        for file_obj in files:
+                            try:
+                                file_obj.close()
+                            except Exception:
+                                self.logger.debug("Discord添付ファイルのハンドルを閉じられませんでした", exc_info=True)
+                    last_error = None
                     break
-                await asyncio.sleep(2 ** (attempt + 1))
-            except (asyncio.TimeoutError, OSError) as exc:
-                last_error = exc
-                if attempt >= 2:
-                    break
-                await asyncio.sleep(2 ** (attempt + 1))
+                except discord.HTTPException as exc:
+                    last_error = exc
+                    if exc.status < 500 or attempt >= 2:
+                        break
+                    await asyncio.sleep(2 ** (attempt + 1))
+                except (asyncio.TimeoutError, OSError) as exc:
+                    last_error = exc
+                    if attempt >= 2:
+                        break
+                    await asyncio.sleep(2 ** (attempt + 1))
+            if last_error is not None:
+                break
+        if last_error is None:
+            return
         if last_error is not None:
             if isinstance(last_error, discord.Forbidden):
                 raise RuntimeError("Discordへの送信権限がありません。チャンネルの送信・ファイル添付権限を確認してください。") from last_error

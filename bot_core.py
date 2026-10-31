@@ -192,7 +192,10 @@ def normalize_display_settings(value: object) -> dict[str, object]:
     raw_channels = value.get("channels", {})
     if not isinstance(raw_channels, dict):
         raise ValueError("display_settings.channels はチャンネルIDをキーにしたJSONオブジェクトにしてください。")
-    channels: dict[int, dict[str, object]] = {}
+    # Channel entries may be a reusable group name, a group plus overrides,
+    # or a channel-specific settings object. Preserve group references so
+    # changing a named profile also updates every channel assigned to it.
+    channels: dict[int, object] = {}
     for raw_id, raw_profile in raw_channels.items():
         try:
             channel_id = int(raw_id)
@@ -211,7 +214,7 @@ def normalize_display_settings(value: object) -> dict[str, object]:
                     f"display_settings.channels.{channel_id} が参照するグループがありません: {raw_profile!r}。"
                     "display_settings.groups にグループを定義してください。"
                 )
-            channels[channel_id] = dict(groups[group_name])
+            channels[channel_id] = group_name
             continue
 
         if not isinstance(raw_profile, dict):
@@ -230,9 +233,16 @@ def normalize_display_settings(value: object) -> dict[str, object]:
                     "display_settings.groups にグループを定義してください。"
                 )
         base = dict(groups[group_name]) if group_name else {}
-        channels[channel_id] = _normalize_display_profile(
+        normalized_profile = _normalize_display_profile(
             profile_values, base=base, context=f"channels.{channel_id}"
         )
+        if group_name:
+            # Store only the explicit overrides alongside the group reference.
+            # Missing fields continue to inherit updates to that named group.
+            overrides = {key: normalized_profile[key] for key in profile_values}
+            channels[channel_id] = {"group": group_name, **overrides}
+        else:
+            channels[channel_id] = normalized_profile
 
     return {"default": default, "groups": groups, "channels": channels}
 
@@ -241,14 +251,53 @@ def resolve_display_settings(settings: object, channel_id: int | str) -> dict[st
     """Resolve display settings for one channel, including reusable groups."""
     normalized = normalize_display_settings(settings)
     default = dict(normalized["default"])  # type: ignore[arg-type]
+    groups = normalized["groups"]  # type: ignore[assignment]
     channels = normalized["channels"]  # type: ignore[assignment]
     try:
         numeric_id = int(channel_id)
     except (TypeError, ValueError):
         numeric_id = -1
-    overrides = channels.get(numeric_id, {})  # type: ignore[union-attr]
-    default.update(overrides)
+    channel_profile = channels.get(numeric_id, {})  # type: ignore[union-attr]
+    if isinstance(channel_profile, str):
+        default.update(groups.get(channel_profile, {}))  # type: ignore[union-attr]
+    elif isinstance(channel_profile, dict):
+        group_name = channel_profile.get("group")
+        if isinstance(group_name, str):
+            default.update(groups.get(group_name, {}))  # type: ignore[union-attr]
+        default.update({key: value for key, value in channel_profile.items() if key != "group"})
     return default
+
+
+def normalize_channel_bool_overrides(value: object, *, setting_name: str) -> dict[int, bool]:
+    """Validate per-channel boolean overrides stored in config.json."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(f"{setting_name} はチャンネルIDをキーにしたJSONオブジェクトにしてください。")
+    normalized: dict[int, bool] = {}
+    for raw_channel_id, raw_enabled in value.items():
+        try:
+            channel_id = int(raw_channel_id)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{setting_name} のチャンネルIDが整数ではありません: {raw_channel_id!r}") from exc
+        if channel_id <= 0:
+            raise ValueError(f"{setting_name} のチャンネルIDは正の整数にしてください: {raw_channel_id!r}")
+        if channel_id in normalized:
+            raise ValueError(f"{setting_name} に重複するチャンネルIDがあります: {channel_id}")
+        if not isinstance(raw_enabled, bool):
+            raise ValueError(f"{setting_name}.{channel_id} は true または false にしてください。")
+        normalized[channel_id] = raw_enabled
+    return normalized
+
+
+def resolve_channel_bool_setting(default: bool, overrides: object, channel_id: int | str) -> bool:
+    """Return a global boolean default overridden by an optional channel value."""
+    normalized = normalize_channel_bool_overrides(overrides, setting_name="channel_bool_overrides")
+    try:
+        numeric_id = int(channel_id)
+    except (TypeError, ValueError):
+        numeric_id = -1
+    return normalized.get(numeric_id, default)
 
 
 def format_post_metadata(

@@ -9,6 +9,7 @@ from bot_core import (
     normalize_cookie_browsers, normalize_x_url, normalize_pixiv_url, normalize_media_url,
     normalize_display_settings, resolve_display_settings, should_ignore_bot_message,
     message_text_for_url_detection, looks_like_auth_error,
+    browser_cookie_lock_guidance,
 )
 
 
@@ -182,6 +183,18 @@ class AuthFallbackTests(unittest.TestCase):
 
     def test_unrelated_errors_do_not_trigger_browser_fallback(self):
         self.assertFalse(looks_like_auth_error(RuntimeError("HTTP Error 404: Not Found")))
+
+
+class BrowserCookieLockGuidanceTests(unittest.TestCase):
+    def test_chromium_cookie_copy_error_returns_actionable_guidance(self):
+        guidance = browser_cookie_lock_guidance(
+            "ERROR: Could not copy Chrome cookie database. See https://github.com/yt-dlp/yt-dlp/issues/7271"
+        )
+        self.assertIn("Brave/Chrome", guidance)
+        self.assertIn("brave.exe", guidance)
+
+    def test_unrelated_error_does_not_return_cookie_lock_guidance(self):
+        self.assertEqual(browser_cookie_lock_guidance("HTTP Error 404: Not Found"), "")
 
 
 class CookieBrowserConfigTests(unittest.TestCase):

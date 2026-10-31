@@ -1,24 +1,24 @@
 {
-
-  "cookies_file": "cookies.txt",
-
   "monitored_channel_ids": [
-    1563019490688761916,
     1562916824792825957,
+    1563019490688761916,
     1563607259903303883,
-    1563639015901761566
+    1563639015901761566,
+    1563796678572642365,
+    1564947837614161940,
+    1565201790532714596
   ],
   "temp_dir": "temp",
   "max_concurrent_downloads": 2,
   "max_queue_size": 20,
-  "max_download_size_mb": 2048,
+  "max_download_size_mb": 8192,
   "cookies_from_browser": "",
   "max_upload_size_mb": 0,
   "fallback_upload_limit_mb": 20,
   "compress_if_too_large": true,
-  "compression_attempts": 4,
+  "compression_attempts": 8,
   "compression_audio_bitrate_kbps": 96,
-  "compression_min_video_bitrate_kbps": 250,
+  "compression_min_video_bitrate_kbps": 100,
   "ffmpeg_path": "",
   "ffprobe_path": "",
   "log_level": "INFO",
@@ -54,11 +54,20 @@
       "1563019490688761916": "archive",
       "1562916824792825957": "links_only",
       "1563607259903303883": "links_only",
-      "1563639015901761566": "links_only"
+      "1563639015901761566": "links_only",
+      "1563796678572642365": "archive",
+      "1565201790532714596": "links_only"
     }
   },
   "cookies_from_browsers": [
     "firefox",
     "brave"
-  ]
+  ],
+  "cookies_file": "",
+  "use_gpu_decode": true,
+  "max_split_parts": 100,
+  "deduplicate_posts_by_channel": {
+    "1563639015901761566": false,
+    "1565201790532714596": false
+  }
 }
